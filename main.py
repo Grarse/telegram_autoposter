@@ -1,243 +1,249 @@
-# main.py
+# main.py — RSS → GPT → Telegram (полностью автономно)
 import os
 import time
+import json
 import logging
+import threading
+import re
+import queue
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import feedparser
 import httpx
-import telebot
-import gspread
-from google.oauth2.service_account import Credentials
 from openai import OpenAI
+import telebot
 
-# ------------------------------------
-# ЛОГИРОВАНИЕ
-# ------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+# ----------------- ЛОГИ -----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("autoposter")
 
-# ------------------------------------
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# ------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID_ENV = os.getenv("CHANNEL_ID", "").strip()
-SHEET_ID = os.getenv("SHEET_ID", "").strip()
+# ----------------- ENV -----------------
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ENV = os.getenv("CHANNEL_ID", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-if not BOT_TOKEN or not CHANNEL_ID_ENV or not SHEET_ID or not OPENAI_API_KEY:
-    logging.error("Не заданы одна или несколько переменных окружения: "
-                  "BOT_TOKEN, CHANNEL_ID, SHEET_ID, OPENAI_API_KEY")
-    raise SystemExit(1)
+GPT_MODEL   = os.getenv("GPT_MODEL", "gpt-4o-mini")
 
-# CHANNEL_ID строго int (формат для каналов: -100xxxxxxxxxx)
+# Интервалы и поведение
+POST_INTERVAL_MIN = int(os.getenv("POST_INTERVAL_MIN", "30"))  # каждые 30 минут
+RSS_POLL_SEC      = int(os.getenv("RSS_POLL_SEC", "120"))      # опрос лент раз в 120 сек
+ALLOW_BREAKING    = os.getenv("ALLOW_BREAKING", "1") == "1"    # “срочное” — публиковать сразу
+
+# Стиль
+SARCASM_LEVEL     = os.getenv("SARCASM_LEVEL", "medium")       # none|low|medium|high
+POST_HISTORY_MODE = os.getenv("POST_HISTORY_MODE", "mixed")    # off|mixed|always
+LONG_POST_SHARE   = float(os.getenv("LONG_POST_SHARE", "0.20"))# 20% длинные посты
+SHORT_MIN, SHORT_MAX = int(os.getenv("SHORT_MIN_CHARS", "400")), int(os.getenv("SHORT_MAX_CHARS", "600"))
+LONG_MIN,  LONG_MAX  = int(os.getenv("LONG_MIN_CHARS",  "1000")), int(os.getenv("LONG_MAX_CHARS",  "1200"))
+
+# Ключевые слова “молний”
+BREAKING_WORDS = [w.strip().lower() for w in os.getenv("BREAKING_KEYWORDS_RU","срочно;молния;экстренно;urgent;breaking").split(";")]
+
+# RSS-ленты: одна строка JSON-массива
+FEEDS_JSON = os.getenv("FEEDS_JSON", "[]")
+
+# Валидация
+if not BOT_TOKEN or not CHANNEL_ENV or not OPENAI_API_KEY:
+    raise SystemExit("ENV обязательны: BOT_TOKEN, CHANNEL_ID, OPENAI_API_KEY")
+
 try:
-    CHANNEL_ID = int(CHANNEL_ID_ENV)
-except ValueError:
-    logging.error(
-        "CHANNEL_ID должен быть целым числом (например -1001234567890). "
-        f"Сейчас: {CHANNEL_ID_ENV}"
-    )
-    raise SystemExit(1)
+    CHANNEL_ID: int | str = int(CHANNEL_ENV) if CHANNEL_ENV.startswith("-100") else CHANNEL_ENV
+except Exception:
+    CHANNEL_ID = CHANNEL_ENV  # позволяем @username
 
-# ------------------------------------
-# ИНИЦИАЛИЗАЦИЯ TELEGRAM
-# ------------------------------------
+# ----------------- КЛИЕНТЫ -----------------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ------------------------------------
-# Google Sheets
-# Секрет с ключом сервисного аккаунта лежит в Secret Files как: credentials.json
-# Render смонтирует его по пути: /etc/secrets/credentials.json
-# ------------------------------------
-GOOGLE_CREDS_FILE = "/etc/secrets/credentials.json"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Жёстко отрубаем прокси из окружения (чтобы не было ошибки 'proxies')
+for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"]:
+    os.environ.pop(k, None)
 
-try:
-    _creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
-    _gclient = gspread.authorize(_creds)
-    sh = _gclient.open_by_key(SHEET_ID)
-    sheet = sh.sheet1  # работаем с первым листом
-    logging.info("Google Sheets: подключение успешно.")
-except Exception as e:
-    logging.error("Google Sheets: не удалось подключиться. " + str(e))
-    raise
+oai = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False))
 
-# ------------------------------------
-# OpenAI (НОВЫЙ SDK)
-# Вырезаем любые прокси-переменные из окружения и говорим клиенту их игнорировать
-# ------------------------------------
-for _v in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-           "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"]:
-    os.environ.pop(_v, None)
+# ----------------- МОДЕЛИ ДАННЫХ -----------------
+@dataclass
+class NewsItem:
+    title: str
+    link: str
+    summary: str
+    published: Optional[datetime]
+    breaking: bool
 
-client = OpenAI(
-    api_key=OPENAI_API_KEY,
-    http_client=httpx.Client(trust_env=False)  # критично: не подтягивать прокси из окружения
-)
+# ----------------- ОЧЕРЕДЬ/ДЕДУП -----------------
+seen_links: set[str] = set()
+news_q: "queue.Queue[NewsItem]" = queue.Queue()
 
-# ------------------------------------
-# УТИЛИТЫ
-# ------------------------------------
-def now_utc_minutes() -> int:
-    """Текущие минуты с эпохи (для внутренних таймеров)."""
-    return int(datetime.now(timezone.utc).timestamp() // 60)
+# ----------------- ХЕЛПЕРЫ -----------------
+def is_breaking(title: str, summary: str) -> bool:
+    t = (title or "").lower() + " " + (summary or "").lower()
+    return any(w and w in t for w in BREAKING_WORDS)
 
-def parse_schedule_cell(value: str) -> Optional[datetime]:
-    """
-    Парсинг даты/времени из ячейки «Время публикации».
-    Ожидается строка формата 'YYYY-MM-DD HH:MM' (UTC).
-    Если формат другой — возвращаем None и публикуем сразу,
-    как только дойдём до этой строки.
-    """
-    v = (value or "").strip()
-    if not v:
-        return None
+def parse_time(entry) -> Optional[datetime]:
+    # feedparser возвращает published_parsed/updated_parsed как time.struct_time
+    for attr in ("published_parsed", "updated_parsed"):
+        ts = getattr(entry, attr, None)
+        if ts:
+            try:
+                dt = datetime(*ts[:6], tzinfo=timezone.utc).astimezone()
+                return dt
+            except Exception:
+                pass
+    return None
+
+def load_feeds() -> list[str]:
     try:
-        return datetime.strptime(v, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        arr = json.loads(FEEDS_JSON)
+        return [x for x in arr if isinstance(x, str)]
     except Exception:
-        return None
+        return []
 
-def normalize_text(x: str) -> str:
-    return (x or "").strip()
+def pick_length() -> tuple[int,int,bool]:
+    """возвращает (min, max, is_long)"""
+    import random
+    if random.random() < LONG_POST_SHARE:
+        return (LONG_MIN, LONG_MAX, True)
+    return (SHORT_MIN, SHORT_MAX, False)
 
-# ------------------------------------
-# GPT: генерация текста поста
-# ------------------------------------
-def generate_post(theme_hint: str) -> str:
-    """
-    Генерируем пост по краткой подсказке (theme_hint) на русском.
-    80% – короткие заметки (400–600 символов), 20% – мини-аналитика (1000–1200).
-    Без хештегов. Допускаем юмор и лёгкий сарказм. Историческая справка – mixed.
-    """
-    prompt = f"""
-Ты — автор телеграм-канала о финансах и бизнес-трендах. Пиши на русском.
-Тема/повод: «{theme_hint}».
+def want_history() -> bool:
+    if POST_HISTORY_MODE == "always": return True
+    if POST_HISTORY_MODE == "off":    return False
+    # mixed — примерно каждый третий
+    return (int(time.time() // (POST_INTERVAL_MIN*60)) % 3) == 0
 
-Правила:
-1) 80% постов — 400–600 символов, 20% — 1000–1200 символов.
-2) Без хештегов, эмодзи можно, но умеренно.
-3) Стиль: живо, умно, чуть саркастично; без перехода на личности.
-4) Если уместно — дай короткую историческую ремарку (1–2 предложения).
-5) Не дублируй тему в заголовке; сразу в суть.
-6) Не проси подписаться, не делай CTA.
+def sarcasm_hint() -> str:
+    return {
+        "high":   "Добавь заметный, но уместный сарказм.",
+        "medium": "Добавь лёгкий сарказм.",
+        "low":    "Добавь едва заметную иронию.",
+        "none":   "Без сарказма."
+    }.get(SARCASM_LEVEL, "Добавь лёгкий сарказм.")
 
-Выдай только чистый текст поста (без префиксов и маркировок).
-"""
-    try:
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=prompt
-        )
-        text = (resp.output_text or "").strip()
-        if not text:
-            raise ValueError("Пустой ответ GPT")
-        return text
-    except Exception as e:
-        logging.error(f"GPT: ошибка генерации — {e}")
-        # Фолбэк: хотя бы вернём тему
-        return f"Короткая заметка: {theme_hint}"
+# ----------------- GPT -----------------
+def make_post(item: NewsItem) -> str:
+    lo, hi, is_long = pick_length()
+    hist = "Добавь короткую историческую параллель (1–2 предложения)." if want_history() else "Историческую справку не добавляй."
+    sys = (
+        "Ты редактор русскоязычного телеграм-канала о финансах/экономике. "
+        "Пиши ясно, без воды, с лёгким юмором/сарказмом, но без токсичности и без хештегов."
+    )
+    user = (
+        f"Сформируй {'мини-аналитику' if is_long else 'короткую заметку'} на русском языком.\n"
+        f"Требуемый объём: {lo}-{hi} символов.\n"
+        f"{sarcasm_hint()}\n{hist}\n\n"
+        f"Новость:\nЗаголовок: {item.title}\n"
+        f"Кратко: {item.summary[:600]}\n"
+        f"Ссылка: {item.link}\n\n"
+        "Выведи только готовый текст поста, без хештегов и призывов подписаться."
+    )
+    resp = oai.chat.completions.create(
+        model=GPT_MODEL,
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+        temperature=0.7,
+        max_tokens=800,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
-# ------------------------------------
-# Telegram отправка
-# ------------------------------------
-def send_to_telegram(text: str, image_url: str = "") -> None:
-    """
-    Отправка в канал: с изображением (если есть) или просто текст.
-    """
-    try:
-        if normalize_text(image_url):
-            # Сначала фото, текст в caption
-            bot.send_photo(CHANNEL_ID, image_url, caption=text)
-        else:
-            bot.send_message(CHANNEL_ID, text)
-    except Exception as e:
-        logging.error(f"Telegram: ошибка отправки — {e}")
-        raise
+# ----------------- ПОСТИНГ -----------------
+def send_text(text: str):
+    msg = text[:4096]
+    bot.send_message(CHANNEL_ID, msg)
 
-# ------------------------------------
-# Основной цикл:
-# Таблица (первый лист) с колонками:
-# A: «Время публикации» (UTC, 'YYYY-MM-DD HH:MM') — можно пусто
-# B: «Текст поста» — если пусто, сгенерируем через GPT
-# C: «Ссылка на изображение» — можно пусто
-# D: «Статус» — пусто = не опубликовано; пишем OK / ERROR:...
-# ------------------------------------
-HEADER_TIME = "Время публикации"
-HEADER_TEXT = "Текст поста"
-HEADER_IMAGE = "Ссылка на изображение"
-HEADER_STATUS = "Статус"
+def publish(item: NewsItem):
+    text = make_post(item)
+    send_text(text)
+    log.info("Опубликовано: %s", item.title)
 
-def read_rows():
-    """Чтение всех строк с учётом заголовка."""
-    rows = sheet.get_all_records(default_blank="")
-    return rows
-
-def write_status(row_index_one_based: int, status_text: str):
-    """
-    Запись статуса в колонку D (Статус).
-    row_index_one_based — индекс строки с 1 с учётом заголовков.
-    """
-    try:
-        sheet.update_cell(row_index_one_based, 4, status_text)
-    except Exception as e:
-        logging.error(f"Sheets: не удалось записать статус для строки {row_index_one_based}: {e}")
-
-def process_row(row: dict, row_index_one_based: int):
-    """
-    Обработка одной строки.
-    Если 'Статус' пуст, а время <= сейчас (или пусто) — публикуем.
-    """
-    status = normalize_text(row.get(HEADER_STATUS, ""))
-    if status:
-        return  # уже обработано
-
-    time_cell = normalize_text(row.get(HEADER_TIME, ""))
-    text_cell = normalize_text(row.get(HEADER_TEXT, ""))
-    image_cell = normalize_text(row.get(HEADER_IMAGE, ""))
-
-    # Проверяем расписание (UTC)
-    when_dt = parse_schedule_cell(time_cell)
-    if when_dt and datetime.now(timezone.utc) < when_dt:
-        # Ещё не настало
+# ----------------- ПОТОК ОПРОСА RSS -----------------
+def poller():
+    feeds = load_feeds()
+    if not feeds:
+        log.warning("FEEDS_JSON пуст — ленты не заданы.")
         return
-
-    # Если текста нет — просим GPT сделать пост по намёку
-    # Намёком считаем либо указанный «Текст поста» (как тема),
-    # либо «Публикация», если вообще пусто.
-    if not text_cell:
-        text_cell = generate_post(theme_hint="Публикация для канала о финансах и трендах")
-    else:
-        # Если автор сам дал тему-рыбу (очень коротко), можно попросить GPT развернуть.
-        if len(text_cell) < 60:
-            text_cell = generate_post(theme_hint=text_cell)
-
-    # Отправляем в Telegram
-    try:
-        send_to_telegram(text_cell, image_cell)
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        write_status(row_index_one_based, f"OK {stamp}")
-        logging.info(f"Опубликовано: строка {row_index_one_based}")
-    except Exception as e:
-        write_status(row_index_one_based, f"ERROR: {e}")
-        logging.error(f"Публикация НЕ удалась (строка {row_index_one_based}): {e}")
-
-def main_loop():
-    logging.info("Сервис запущен. Работаем по таблице Google Sheets.")
+    log.info("RSS poller: %d лент, интервал %d сек.", len(feeds), RSS_POLL_SEC)
     while True:
         try:
-            rows = read_rows()
-            # get_all_records возвращает данные без строки заголовка,
-            # поэтому первая «данная» строка = 2 в таблице
-            for i, row in enumerate(rows, start=2):
-                process_row(row, i)
+            for url in feeds:
+                try:
+                    d = feedparser.parse(url)
+                    for e in d.entries[:20]:
+                        link = getattr(e, "link", "") or ""
+                        if not link or link in seen_links:
+                            continue
+                        title = getattr(e, "title", "") or ""
+                        summary = re.sub("<[^>]+>", "", getattr(e, "summary", "") or "").strip()
+                        item = NewsItem(
+                            title=title.strip(),
+                            link=link.strip(),
+                            summary=summary,
+                            published=parse_time(e),
+                            breaking=is_breaking(title, summary),
+                        )
+                        seen_links.add(link)
+                        news_q.put(item)
+                except Exception as fe:
+                    log.warning("Feed error %s: %s", url, fe)
         except Exception as e:
-            logging.error(f"Главный цикл: ошибка чтения/обработки — {e}")
+            log.exception("RSS poller error: %s", e)
+        time.sleep(RSS_POLL_SEC)
 
-        # Проверяем таблицу каждую минуту
+# ----------------- ПОТОК ПУБЛИКАЦИИ -----------------
+def publisher():
+    log.info("Publisher: интервал %d мин, breaking=%s", POST_INTERVAL_MIN, ALLOW_BREAKING)
+    last_post_ts = 0.0
+    interval = POST_INTERVAL_MIN * 60
+    while True:
+        try:
+            # Срочные — сразу
+            if ALLOW_BREAKING:
+                try:
+                    it = news_q.get_nowait()
+                    if it.breaking:
+                        log.info("BREAKING: %s", it.title)
+                        publish(it)
+                        last_post_ts = time.time()
+                        continue
+                    else:
+                        # Вернём, если не срочная
+                        news_q.put(it)
+                except queue.Empty:
+                    pass
+
+            # Плановая публикация по интервалу
+            if time.time() - last_post_ts >= interval:
+                item = None
+                # Пытаемся взять новость из очереди
+                for _ in range(10):
+                    try:
+                        item = news_q.get_nowait()
+                        break
+                    except queue.Empty:
+                        time.sleep(1)
+                if item:
+                    log.info("Scheduled post: %s", item.title)
+                    publish(item)
+                    last_post_ts = time.time()
+                else:
+                    log.info("Очередь пуста, ждём...")
+            time.sleep(2)
+        except Exception as e:
+            log.exception("Publisher error: %s", e)
+            time.sleep(5)
+
+# ----------------- MAIN -----------------
+def main():
+    # Проверим токен Telegram
+    me = bot.get_me()
+    log.info("Telegram бот: @%s", me.username)
+
+    # Запускаем два фоновых потока
+    threading.Thread(target=poller,   daemon=True).start()
+    threading.Thread(target=publisher, daemon=True).start()
+
+    # Keep-alive
+    while True:
         time.sleep(60)
 
 if __name__ == "__main__":
-    main_loop()
+    main()
