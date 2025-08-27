@@ -2,26 +2,26 @@
 import os
 import time
 import logging
-import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
 import telebot
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 
-# -----------------------------
-# Настройки логгирования
-# -----------------------------
+# ------------------------------------
+# ЛОГИРОВАНИЕ
+# ------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# -----------------------------
-# Переменные окружения
-# -----------------------------
+# ------------------------------------
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_ID_ENV = os.getenv("CHANNEL_ID", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
@@ -32,221 +32,212 @@ if not BOT_TOKEN or not CHANNEL_ID_ENV or not SHEET_ID or not OPENAI_API_KEY:
                   "BOT_TOKEN, CHANNEL_ID, SHEET_ID, OPENAI_API_KEY")
     raise SystemExit(1)
 
-# Telegram channel id должен быть int
+# CHANNEL_ID строго int (формат для каналов: -100xxxxxxxxxx)
 try:
     CHANNEL_ID = int(CHANNEL_ID_ENV)
 except ValueError:
-    logging.error("CHANNEL_ID должен быть целым числом (например -1001234567890). "
-                  f"Сейчас: {CHANNEL_ID_ENV}")
+    logging.error(
+        "CHANNEL_ID должен быть целым числом (например -1001234567890). "
+        f"Сейчас: {CHANNEL_ID_ENV}"
+    )
     raise SystemExit(1)
 
-# -----------------------------
-# Инициализация клиентов
-# -----------------------------
+# ------------------------------------
+# ИНИЦИАЛИЗАЦИЯ TELEGRAM
+# ------------------------------------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Google Sheets (service account JSON лежит в Secret Files → /etc/secrets/credentials.json)
+# ------------------------------------
+# Google Sheets
+# Секрет с ключом сервисного аккаунта лежит в Secret Files как: credentials.json
+# Render смонтирует его по пути: /etc/secrets/credentials.json
+# ------------------------------------
 GOOGLE_CREDS_FILE = "/etc/secrets/credentials.json"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
 try:
     _creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
-    gclient = gspread.authorize(_creds)
-    sh = gclient.open_by_key(SHEET_ID)
+    _gclient = gspread.authorize(_creds)
+    sh = _gclient.open_by_key(SHEET_ID)
     sheet = sh.sheet1  # работаем с первым листом
     logging.info("Google Sheets: подключение успешно.")
 except Exception as e:
     logging.error("Google Sheets: не удалось подключиться. " + str(e))
     raise
 
-# OpenAI (новый SDK)
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ------------------------------------
+# OpenAI (НОВЫЙ SDK)
+# Вырезаем любые прокси-переменные из окружения и говорим клиенту их игнорировать
+# ------------------------------------
+for _v in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+           "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"]:
+    os.environ.pop(_v, None)
 
-# -----------------------------
-# Утилиты
-# -----------------------------
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    http_client=httpx.Client(trust_env=False)  # критично: не подтягивать прокси из окружения
+)
+
+# ------------------------------------
+# УТИЛИТЫ
+# ------------------------------------
 def now_utc_minutes() -> int:
-    """Минуты от эпохи (для сверки внутренних таймеров)."""
+    """Текущие минуты с эпохи (для внутренних таймеров)."""
     return int(datetime.now(timezone.utc).timestamp() // 60)
 
 def parse_schedule_cell(value: str) -> Optional[datetime]:
     """
-    Парсинг даты/времени из ячейки 'Время публикации'.
+    Парсинг даты/времени из ячейки «Время публикации».
     Ожидается строка формата 'YYYY-MM-DD HH:MM' (UTC).
-    Если формат другой — можно донастроить парсер.
+    Если формат другой — возвращаем None и публикуем сразу,
+    как только дойдём до этой строки.
     """
+    v = (value or "").strip()
+    if not v:
+        return None
     try:
-        value = (value or "").strip()
-        if not value:
-            return None
-        # Предполагаем UTC. Если нужно — подстрой под свой часовой пояс.
-        return datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        return datetime.strptime(v, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
-def pick_length_hint() -> str:
-    """
-    80% короткие (400–600), 20% длинные (1000–1200).
-    Возвращает текстовую подсказку для промпта.
-    """
-    import random
-    if random.random() < 0.8:
-        return "Короткая заметка 400–600 символов."
-    return "Расширенная мини-аналитика 1000–1200 символов."
+def normalize_text(x: str) -> str:
+    return (x or "").strip()
 
-def historical_blend_hint() -> str:
+# ------------------------------------
+# GPT: генерация текста поста
+# ------------------------------------
+def generate_post(theme_hint: str) -> str:
     """
-    Историческая справка: mixed (иногда короткая историческая ремарка).
+    Генерируем пост по краткой подсказке (theme_hint) на русском.
+    80% – короткие заметки (400–600 символов), 20% – мини-аналитика (1000–1200).
+    Без хештегов. Допускаем юмор и лёгкий сарказм. Историческая справка – mixed.
     """
-    import random
-    if random.random() < 0.5:
-        return "Добавь 1–2 предложения исторического контекста (если уместно)."
-    return "Без исторического экскурса, только по сути."
+    prompt = f"""
+Ты — автор телеграм-канала о финансах и бизнес-трендах. Пиши на русском.
+Тема/повод: «{theme_hint}».
 
-def build_prompt(base: str) -> str:
-    """
-    Формирует промпт для GPT по нашим правилам (RU, сарказм/юмор, стиль и длина).
-    """
-    return f"""
-Ты — редактор телеграм-канала о финансах и экономике. Пиши на русском.
-Правила стиля:
-- 80% постов — короткие заметки, 20% — мини-аналитики (в этом задании ориентируйся на подсказку ниже).
-- Лёгкий юмор и ирония допустимы, но без токсичности и перехода на личности.
-- Без хэштегов, эмодзи — можно 1–2 максимум, если очень уместно.
-- Ясная структура: один основной тезис + 1–2 факта/цифры/пример + один вывод/что это значит.
+Правила:
+1) 80% постов — 400–600 символов, 20% — 1000–1200 символов.
+2) Без хештегов, эмодзи можно, но умеренно.
+3) Стиль: живо, умно, чуть саркастично; без перехода на личности.
+4) Если уместно — дай короткую историческую ремарку (1–2 предложения).
+5) Не дублируй тему в заголовке; сразу в суть.
+6) Не проси подписаться, не делай CTA.
 
-Тема / сырьё:
-{base}
-
-Требования к объёму: {pick_length_hint()}
-{historical_blend_hint()}
-
-Выведи только готовый текст поста без приветствий и заключительных фраз типа "подписывайтесь".
+Выдай только чистый текст поста (без префиксов и маркировок).
 """
-
-def generate_text_with_gpt(seed: str) -> str:
-    """
-    Генерация текста через новый OpenAI SDK.
-    Используем chat.completions (новый способ через client.*).
-    """
     try:
-        resp = client.chat.completions.create(
+        resp = client.responses.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Ты опытный финансовый редактор телеграм-канала."},
-                {"role": "user", "content": build_prompt(seed)}
-            ],
-            temperature=0.7,
-            top_p=0.9,
+            input=prompt
         )
-        text = (resp.choices[0].message.content or "").strip()
+        text = (resp.output_text or "").strip()
+        if not text:
+            raise ValueError("Пустой ответ GPT")
         return text
     except Exception as e:
-        logging.error("OpenAI error: %s", e)
-        return ""
+        logging.error(f"GPT: ошибка генерации — {e}")
+        # Фолбэк: хотя бы вернём тему
+        return f"Короткая заметка: {theme_hint}"
 
-def send_to_channel(text: str, image_url: Optional[str]) -> bool:
+# ------------------------------------
+# Telegram отправка
+# ------------------------------------
+def send_to_telegram(text: str, image_url: str = "") -> None:
     """
-    Публикация в канал. Если есть картинка — отправляем фото с подписью.
+    Отправка в канал: с изображением (если есть) или просто текст.
     """
     try:
-        if image_url:
-            # caption в Telegram ограничен ~1024 символами — подрежем при необходимости
-            caption = (text or "")[:1024] if text else ""
-            bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=caption)
+        if normalize_text(image_url):
+            # Сначала фото, текст в caption
+            bot.send_photo(CHANNEL_ID, image_url, caption=text)
         else:
-            # Ограничение Telegram ~4096 символов — подрежем
-            msg = (text or "")[:4096]
-            bot.send_message(chat_id=CHANNEL_ID, text=msg)
-        return True
+            bot.send_message(CHANNEL_ID, text)
     except Exception as e:
-        logging.error("Ошибка отправки в Telegram: %s", e)
-        return False
+        logging.error(f"Telegram: ошибка отправки — {e}")
+        raise
 
-def process_sheet_once():
+# ------------------------------------
+# Основной цикл:
+# Таблица (первый лист) с колонками:
+# A: «Время публикации» (UTC, 'YYYY-MM-DD HH:MM') — можно пусто
+# B: «Текст поста» — если пусто, сгенерируем через GPT
+# C: «Ссылка на изображение» — можно пусто
+# D: «Статус» — пусто = не опубликовано; пишем OK / ERROR:...
+# ------------------------------------
+HEADER_TIME = "Время публикации"
+HEADER_TEXT = "Текст поста"
+HEADER_IMAGE = "Ссылка на изображение"
+HEADER_STATUS = "Статус"
+
+def read_rows():
+    """Чтение всех строк с учётом заголовка."""
+    rows = sheet.get_all_records(default_blank="")
+    return rows
+
+def write_status(row_index_one_based: int, status_text: str):
     """
-    Считываем все строки, ищем те, где:
-      - Время публикации <= сейчас (UTC)
-      - Статус пуст
-    Обрабатываем последовательно.
+    Запись статуса в колонку D (Статус).
+    row_index_one_based — индекс строки с 1 с учётом заголовков.
     """
     try:
-        rows = sheet.get_all_records(expected_headers=[
-            "Время публикации",
-            "Текст поста",
-            "Ссылка на изображение",
-            "Статус",
-        ])
-        # gspread возвращает записи без индекса строки; запрашиваем все значения,
-        # чтобы знать точные номера строк для обновления «Статуса».
-        all_values = sheet.get_all_values()
-        headers = all_values[0]
-
-        # Индексы столбцов (для точечного обновления)
-        idx_time = headers.index("Время публикации")
-        idx_text = headers.index("Текст поста")
-        idx_img = headers.index("Ссылка на изображение")
-        idx_status = headers.index("Статус")
-
-        # Пройдёмся по строкам, начиная со второй (первая — заголовок)
-        for row_idx in range(1, len(all_values)):
-            row = all_values[row_idx]
-            try:
-                cell_time = row[idx_time].strip() if idx_time < len(row) else ""
-                cell_text = row[idx_text].strip() if idx_text < len(row) else ""
-                cell_img = row[idx_img].strip() if idx_img < len(row) else ""
-                cell_status = row[idx_status].strip() if idx_status < len(row) else ""
-
-                # пропускаем обработанные
-                if cell_status:
-                    continue
-
-                # проверяем расписание
-                dt = parse_schedule_cell(cell_time)
-                if not dt:
-                    # Нет валидного времени — пока пропускаем
-                    continue
-
-                if datetime.now(timezone.utc) < dt:
-                    # Ещё не время
-                    continue
-
-                # Если текст пуст — генерируем
-                text_to_send = cell_text
-                if not text_to_send:
-                    seed = "Срочные финансовые и экономические новости дня. Короткий вывод, что это значит для частного инвестора."
-                    text_to_send = generate_text_with_gpt(seed)
-                    if not text_to_send:
-                        # если GPT не сгенерировал, не блокируем всю очередь — ставим статус ошибки
-                        sheet.update_cell(row_idx + 1, idx_status + 1, "Ошибка GPT")
-                        continue
-
-                ok = send_to_channel(text_to_send, cell_img if cell_img else None)
-                sheet.update_cell(row_idx + 1, idx_status + 1, "ОК" if ok else "Ошибка Telegram")
-
-                # Чтобы не улететь в rate-limit Telegram при пачке постов
-                time.sleep(2)
-
-            except Exception as row_err:
-                logging.error("Ошибка обработки строки %s: %s", row_idx + 1, row_err)
-                try:
-                    sheet.update_cell(row_idx + 1, idx_status + 1, "Ошибка обработки")
-                except Exception:
-                    pass
-
+        sheet.update_cell(row_index_one_based, 4, status_text)
     except Exception as e:
-        logging.error("Ошибка чтения/обработки Google Sheets: %s", e)
-        logging.debug(traceback.format_exc())
+        logging.error(f"Sheets: не удалось записать статус для строки {row_index_one_based}: {e}")
 
-# -----------------------------
-# MAIN LOOP
-# -----------------------------
-if __name__ == "__main__":
-    logging.info("Старт автопостера: Telegram + Google Sheets + GPT")
+def process_row(row: dict, row_index_one_based: int):
+    """
+    Обработка одной строки.
+    Если 'Статус' пуст, а время <= сейчас (или пусто) — публикуем.
+    """
+    status = normalize_text(row.get(HEADER_STATUS, ""))
+    if status:
+        return  # уже обработано
+
+    time_cell = normalize_text(row.get(HEADER_TIME, ""))
+    text_cell = normalize_text(row.get(HEADER_TEXT, ""))
+    image_cell = normalize_text(row.get(HEADER_IMAGE, ""))
+
+    # Проверяем расписание (UTC)
+    when_dt = parse_schedule_cell(time_cell)
+    if when_dt and datetime.now(timezone.utc) < when_dt:
+        # Ещё не настало
+        return
+
+    # Если текста нет — просим GPT сделать пост по намёку
+    # Намёком считаем либо указанный «Текст поста» (как тема),
+    # либо «Публикация», если вообще пусто.
+    if not text_cell:
+        text_cell = generate_post(theme_hint="Публикация для канала о финансах и трендах")
+    else:
+        # Если автор сам дал тему-рыбу (очень коротко), можно попросить GPT развернуть.
+        if len(text_cell) < 60:
+            text_cell = generate_post(theme_hint=text_cell)
+
+    # Отправляем в Telegram
+    try:
+        send_to_telegram(text_cell, image_cell)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        write_status(row_index_one_based, f"OK {stamp}")
+        logging.info(f"Опубликовано: строка {row_index_one_based}")
+    except Exception as e:
+        write_status(row_index_one_based, f"ERROR: {e}")
+        logging.error(f"Публикация НЕ удалась (строка {row_index_one_based}): {e}")
+
+def main_loop():
+    logging.info("Сервис запущен. Работаем по таблице Google Sheets.")
     while True:
         try:
-            process_sheet_once()
-        except Exception as loop_err:
-            logging.error("Критическая ошибка цикла: %s", loop_err)
-            logging.debug(traceback.format_exc())
+            rows = read_rows()
+            # get_all_records возвращает данные без строки заголовка,
+            # поэтому первая «данная» строка = 2 в таблице
+            for i, row in enumerate(rows, start=2):
+                process_row(row, i)
+        except Exception as e:
+            logging.error(f"Главный цикл: ошибка чтения/обработки — {e}")
+
         # Проверяем таблицу каждую минуту
         time.sleep(60)
+
+if __name__ == "__main__":
+    main_loop()
